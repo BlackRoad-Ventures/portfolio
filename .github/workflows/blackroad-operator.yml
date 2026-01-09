@@ -1,0 +1,21 @@
+name: BlackRoad Operator
+on:
+  issues:
+    types: [opened, edited]
+  issue_comment:
+    types: [created]
+
+jobs:
+  blackroad:
+    runs-on: ubuntu-latest
+    if: contains(github.event.comment.body, '@blackroad') || contains(github.event.issue.body, '@blackroad')
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: '🤖 **@blackroad activated** - BlackRoad agents analyzing...'
+            });
