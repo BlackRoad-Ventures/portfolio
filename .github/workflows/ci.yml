@@ -2,14 +2,41 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, master]
   pull_request:
-    branches: [main]
+    branches: [main, master]
+
+permissions:
+  contents: read
+  pull-requests: write
+  checks: write
 
 jobs:
-  test:
-    name: Python ${{ matrix.python-version }}
+  lint:
+    name: Lint
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install linters
+        run: pip install flake8
+
+      - name: Lint src/ and tests/
+        run: |
+          flake8 src/ tests/ deploy/ \
+            --max-line-length=120 \
+            --extend-ignore=E203,W503,E501 \
+            --count --statistics
+
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    needs: lint
     strategy:
       fail-fast: false
       matrix:
@@ -26,24 +53,71 @@ jobs:
       - name: Install dependencies
         run: |
           pip install --upgrade pip
-          pip install pytest pytest-cov flake8
+          pip install pytest pytest-cov
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: Lint with flake8
+      - name: Run unit tests
         run: |
-          flake8 src/ tests/ \
-            --max-line-length=120 \
-            --extend-ignore=E203,W503,E501 \
-            --count --statistics
-
-      - name: Run tests with coverage
-        run: |
-          pytest tests/ -v --tb=short \
+          pytest tests/test_portfolio.py tests/test_stripe_integration.py -v --tb=short \
             --cov=src \
             --cov-report=term-missing \
             --cov-report=xml
 
+  e2e-tests:
+    name: E2E Tests
+    runs-on: ubuntu-latest
+    needs: unit-tests
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install pytest pytest-cov
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Run E2E integration tests
+        run: |
+          pytest tests/test_e2e.py -v --tb=short \
+            --cov=src \
+            --cov-report=term-missing
+
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: lint
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
       - name: Security scan
         run: |
           pip install bandit
-          bandit -r src/ -ll --quiet || true
+          bandit -r src/ deploy/ -ll --quiet || true
+
+  all-checks:
+    name: All Checks Passed
+    runs-on: ubuntu-latest
+    needs: [lint, unit-tests, e2e-tests, security]
+    if: always()
+    steps:
+      - name: Verify all jobs passed
+        run: |
+          if [[ "${{ needs.lint.result }}" != "success" ]] || \
+             [[ "${{ needs.unit-tests.result }}" != "success" ]] || \
+             [[ "${{ needs.e2e-tests.result }}" != "success" ]]; then
+            echo "One or more required jobs failed"
+            exit 1
+          fi
+          echo "All checks passed"

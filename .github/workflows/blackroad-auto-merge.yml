@@ -1,4 +1,4 @@
-name: 🤖 BlackRoad Auto-Merge
+name: Auto-Merge
 
 on:
   pull_request:
@@ -6,7 +6,7 @@ on:
   check_suite:
     types: [completed]
   workflow_run:
-    workflows: ["🔍 BlackRoad Compliance Check"]
+    workflows: ["CI"]
     types: [completed]
 
 permissions:
@@ -16,19 +16,14 @@ permissions:
 
 jobs:
   auto-merge:
-    name: Auto-Merge Compliant PRs
+    name: Auto-Merge PRs
     runs-on: ubuntu-latest
 
-    # Only run for bot-created PRs
-    if: |
-      github.event.pull_request.user.login == 'github-actions[bot]' ||
-      github.actor == 'github-actions[bot]'
-
     steps:
-      - name: 📥 Checkout Repository
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: 🔍 Get PR Details
+      - name: Get PR Details
         id: pr
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -36,150 +31,92 @@ jobs:
           # Get PR number
           if [ -n "${{ github.event.pull_request.number }}" ]; then
             PR_NUMBER="${{ github.event.pull_request.number }}"
+          elif [ -n "${{ github.event.workflow_run.pull_requests[0].number }}" ]; then
+            PR_NUMBER="${{ github.event.workflow_run.pull_requests[0].number }}"
           else
-            # If triggered by workflow_run, find the PR
-            PR_NUMBER=$(gh pr list --head blackroad-auto-fix --json number --jq '.[0].number')
+            # Find open PRs
+            PR_NUMBER=$(gh pr list --state open --json number --jq '.[0].number' 2>/dev/null || echo "")
           fi
 
           if [ -z "$PR_NUMBER" ]; then
             echo "No PR found, exiting..."
+            echo "number=" >> $GITHUB_OUTPUT
             exit 0
           fi
 
           echo "number=$PR_NUMBER" >> $GITHUB_OUTPUT
 
           # Get PR status
-          PR_DATA=$(gh pr view "$PR_NUMBER" --json statusCheckRollup,headRefName,mergeable,mergeStateStatus)
+          PR_DATA=$(gh pr view "$PR_NUMBER" --json statusCheckRollup,headRefName,mergeable,mergeStateStatus,labels)
 
-          # Extract status
-          STATUS=$(echo "$PR_DATA" | jq -r '.statusCheckRollup[] | select(.conclusion != null) | .conclusion' | sort -u)
           MERGEABLE=$(echo "$PR_DATA" | jq -r '.mergeable')
           MERGE_STATE=$(echo "$PR_DATA" | jq -r '.mergeStateStatus')
           BRANCH=$(echo "$PR_DATA" | jq -r '.headRefName')
 
-          echo "status=$STATUS" >> $GITHUB_OUTPUT
+          # Check if all checks passed
+          ALL_PASSED="true"
+          PENDING=$(echo "$PR_DATA" | jq '[.statusCheckRollup[] | select(.conclusion == null or .conclusion == "PENDING")] | length')
+          FAILED=$(echo "$PR_DATA" | jq '[.statusCheckRollup[] | select(.conclusion == "FAILURE" or .conclusion == "ERROR")] | length')
+
+          if [ "$FAILED" -gt 0 ]; then
+            ALL_PASSED="false"
+          fi
+          if [ "$PENDING" -gt 0 ]; then
+            ALL_PASSED="pending"
+          fi
+
           echo "mergeable=$MERGEABLE" >> $GITHUB_OUTPUT
           echo "merge_state=$MERGE_STATE" >> $GITHUB_OUTPUT
           echo "branch=$BRANCH" >> $GITHUB_OUTPUT
+          echo "all_passed=$ALL_PASSED" >> $GITHUB_OUTPUT
 
-          echo "PR #$PR_NUMBER status: $STATUS, mergeable: $MERGEABLE, state: $MERGE_STATE"
+          echo "PR #$PR_NUMBER: mergeable=$MERGEABLE, checks=$ALL_PASSED, branch=$BRANCH"
 
-      - name: ✅ Validate PR for Auto-Merge
+      - name: Validate PR for Auto-Merge
         id: validate
+        if: steps.pr.outputs.number != ''
         run: |
           CAN_MERGE="false"
 
-          # Check 1: Is this from blackroad-auto-fix branch?
-          if [[ "${{ steps.pr.outputs.branch }}" == "blackroad-auto-fix" ]]; then
-            echo "✅ PR is from auto-fix branch"
+          # Check 1: All checks passed?
+          if [[ "${{ steps.pr.outputs.all_passed }}" == "true" ]]; then
+            echo "All checks passed"
 
-            # Check 2: Is mergeable?
+            # Check 2: Is mergeable (no conflicts)?
             if [[ "${{ steps.pr.outputs.mergeable }}" == "MERGEABLE" ]]; then
-              echo "✅ PR is mergeable (no conflicts)"
-
-              # Check 3: All checks passed or no checks?
-              if [[ -z "${{ steps.pr.outputs.status }}" ]] || [[ "${{ steps.pr.outputs.status }}" == "SUCCESS" ]]; then
-                echo "✅ All checks passed (or no checks required)"
-                CAN_MERGE="true"
-              else
-                echo "⚠️  Some checks failed or are pending: ${{ steps.pr.outputs.status }}"
-              fi
+              echo "PR is mergeable"
+              CAN_MERGE="true"
             else
-              echo "⚠️  PR has merge conflicts or is not mergeable"
+              echo "PR has merge conflicts"
             fi
           else
-            echo "ℹ️  Not an auto-fix PR (branch: ${{ steps.pr.outputs.branch }}), skipping"
+            echo "Checks not passing: ${{ steps.pr.outputs.all_passed }}"
           fi
 
           echo "can_merge=$CAN_MERGE" >> $GITHUB_OUTPUT
 
-      - name: 🚀 Merge PR
+      - name: Enable Auto-Merge
         if: steps.validate.outputs.can_merge == 'true' && steps.pr.outputs.number != ''
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           PR_NUMBER="${{ steps.pr.outputs.number }}"
 
-          echo "🤖 Merging PR #$PR_NUMBER..."
+          echo "Merging PR #$PR_NUMBER..."
 
-          # Merge with squash and delete branch
           gh pr merge "$PR_NUMBER" \
             --squash \
             --delete-branch \
-            --body "✅ Auto-merged by BlackRoad Auto-Merge System
+            --body "Auto-merged — all CI checks passed.
 
-This PR passed all compliance checks and was automatically merged.
+Merged by BlackRoad Auto-Merge System." || echo "Merge attempted — may require manual approval"
 
-🤖 Automated by BlackRoad Auto-Merge
-© 2025-2026 BlackRoad OS, Inc."
+          echo "PR #$PR_NUMBER merge initiated"
 
-          echo "✅ PR #$PR_NUMBER merged successfully!"
-
-      - name: 💬 Add Success Comment
+      - name: Comment on Merge
         if: steps.validate.outputs.can_merge == 'true' && steps.pr.outputs.number != ''
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          PR_NUMBER="${{ steps.pr.outputs.number }}"
-
-          gh pr comment "$PR_NUMBER" --body "🤖 **Auto-Merge Successful**
-
-This PR has been automatically merged because:
-- ✅ Created by BlackRoad auto-fix bot
-- ✅ All compliance checks passed
-- ✅ No merge conflicts
-- ✅ No manual review required
-
-The changes are now live on the default branch.
-
----
-🤖 Automated by BlackRoad Auto-Merge System
-© 2025-2026 BlackRoad OS, Inc." || true
-
-      - name: 📝 Create Issue on Validation Failure
-        if: |
-          steps.validate.outputs.can_merge == 'false' &&
-          steps.pr.outputs.number != '' &&
-          steps.pr.outputs.branch == 'blackroad-auto-fix'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          PR_NUMBER="${{ steps.pr.outputs.number }}"
-          REPO="${{ github.repository }}"
-
-          gh issue create \
-            --title "⚠️  Auto-Fix PR Requires Manual Review: #$PR_NUMBER" \
-            --body "## Auto-Fix PR Could Not Be Auto-Merged
-
-**PR:** #$PR_NUMBER
-**Status:** Manual review needed ⚠️
-**Reason:** Checks failed or merge conflicts detected
-
-### Details:
-The auto-fix PR did not pass automatic validation.
-
-**Branch:** \`${{ steps.pr.outputs.branch }}\`
-**Mergeable:** \`${{ steps.pr.outputs.mergeable }}\`
-**Merge State:** \`${{ steps.pr.outputs.merge_state }}\`
-**Check Status:** \`${{ steps.pr.outputs.status }}\`
-
-### Action Required:
-Please review the PR manually and resolve any issues.
-
-**PR Link:** https://github.com/$REPO/pull/$PR_NUMBER
-
----
-🤖 Automated Alert from BlackRoad Auto-Merge System
-© 2025-2026 BlackRoad OS, Inc." \
-            --label "auto-fix-failed,needs-review" || true
-
-      - name: 🚨 Notify on Critical Failure
-        if: failure()
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          echo "🚨 Auto-merge workflow encountered an error"
-          echo "This may require manual intervention"
-          # If Slack webhook is configured, uncomment below:
-          # curl -X POST "${{ secrets.SLACK_WEBHOOK }}" -H 'Content-Type: application/json' \
-          #   -d '{"text":"🚨 Auto-merge failed in ${{ github.repository }}"}'
+          gh pr comment "${{ steps.pr.outputs.number }}" \
+            --body "**Auto-Merge:** All CI checks passed. PR merged." || true

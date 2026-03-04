@@ -1,12 +1,14 @@
 """
 BlackRoad Ventures — Portfolio Metrics Dashboard
-FastAPI app serving portfolio KPIs, funding rounds, and market data.
+FastAPI app serving portfolio KPIs, funding rounds, market data,
+Stripe payment webhooks, and Pi fleet health.
 """
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse
 import json
+import os
 
-app = FastAPI(title="BlackRoad Ventures Dashboard", version="0.1.0")
+app = FastAPI(title="BlackRoad Ventures Dashboard", version="0.2.0")
 
 PORTFOLIO = [
     {"id": "blackroad-os", "name": "BlackRoad OS", "stage": "Series A", "arr": 1_200_000,
@@ -71,3 +73,77 @@ h1{{background:linear-gradient(135deg,#F5A623,#FF1D6C 38.2%,#9C27B0 61.8%,#2979F
 <h2 style="color:#9C27B0">Portfolio</h2>
 {''.join(f'<div class=metric><h3>{c["name"]} — {c["stage"]}</h3><p>${c["mrr"]:,}/mo MRR</p></div>' for c in PORTFOLIO)}
 </body></html>"""
+
+
+# ─── Health endpoint (for Pi fleet monitoring) ────────────────────────────────
+
+
+@app.get("/health")
+def health():
+    return {"status": "healthy", "service": "portfolio-api", "version": "0.2.0"}
+
+
+@app.get("/api/health")
+def api_health():
+    return {"status": "ok", "service": "blackroad-ventures-dashboard"}
+
+
+# ─── Stripe webhook endpoint ─────────────────────────────────────────────────
+
+
+@app.post("/webhooks/stripe")
+async def stripe_webhook(request: Request):
+    """Receive and process Stripe webhook events."""
+    try:
+        from stripe_integration import PaymentService
+    except ImportError:
+        raise HTTPException(500, "Stripe integration not available")
+
+    body = await request.body()
+    sig_header = request.headers.get("stripe-signature", "")
+    webhook_secret = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
+
+    svc = PaymentService(stripe_client=None)
+    try:
+        ok, msg = svc.handle_webhook(body, sig_header, webhook_secret)
+        if ok:
+            return {"status": "ok", "message": msg}
+        return JSONResponse(status_code=400, content={"status": "error", "message": msg})
+    finally:
+        svc.close()
+
+
+# ─── Pi fleet status endpoint ────────────────────────────────────────────────
+
+
+@app.get("/api/pi-fleet")
+def pi_fleet_status():
+    """Return Pi fleet node status."""
+    try:
+        sys_path = os.path.join(os.path.dirname(__file__), "..", "deploy")
+        import sys as _sys
+        _sys.path.insert(0, sys_path)
+        from pi_deploy import PiFleetManager
+    except ImportError:
+        return {"nodes": [], "message": "Pi fleet manager not available"}
+
+    mgr = PiFleetManager()
+    try:
+        nodes = mgr.store.list_nodes()
+        return {
+            "nodes": [
+                {
+                    "id": n.id,
+                    "hostname": n.hostname,
+                    "ip": n.ip_address,
+                    "port": n.port,
+                    "role": n.role,
+                    "status": n.status,
+                    "services": n.services,
+                }
+                for n in nodes
+            ],
+            "routes": mgr.get_routing_table(),
+        }
+    finally:
+        mgr.close()

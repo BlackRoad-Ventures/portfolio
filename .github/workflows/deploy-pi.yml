@@ -1,0 +1,129 @@
+name: Deploy to Pi Fleet
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      target_node:
+        description: "Pi node to deploy to (all, pi-primary, pi-secondary, pi-backup)"
+        required: false
+        default: "all"
+
+jobs:
+  test:
+    name: Pre-Deploy Validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install pytest
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Run full test suite
+        run: pytest tests/ -v --tb=short
+
+  deploy:
+    name: Deploy to Pi Nodes
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: [pi-primary, pi-secondary, pi-backup]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy to ${{ matrix.node }}
+        env:
+          PI_SSH_KEY: ${{ secrets.PI_SSH_KEY }}
+          PI_PRIMARY_HOST: ${{ secrets.PI_PRIMARY_HOST }}
+          PI_SECONDARY_HOST: ${{ secrets.PI_SECONDARY_HOST }}
+          PI_BACKUP_HOST: ${{ secrets.PI_BACKUP_HOST }}
+        run: |
+          NODE="${{ matrix.node }}"
+          echo "Deploying to $NODE..."
+
+          # Resolve target host
+          case $NODE in
+            pi-primary)   HOST="$PI_PRIMARY_HOST" ;;
+            pi-secondary) HOST="$PI_SECONDARY_HOST" ;;
+            pi-backup)    HOST="$PI_BACKUP_HOST" ;;
+          esac
+
+          if [ -z "$HOST" ]; then
+            echo "No host configured for $NODE (set PI_*_HOST secrets)"
+            echo "Skipping deployment — configure secrets to enable"
+            exit 0
+          fi
+
+          # Setup SSH
+          mkdir -p ~/.ssh
+          echo "$PI_SSH_KEY" > ~/.ssh/pi_deploy_key
+          chmod 600 ~/.ssh/pi_deploy_key
+
+          # Rsync source to Pi
+          rsync -avz --delete \
+            -e "ssh -i ~/.ssh/pi_deploy_key -o StrictHostKeyChecking=no" \
+            src/ deploy/ tests/ \
+            "pi@${HOST}:/opt/blackroad/portfolio/"
+
+          # Restart services on Pi
+          ssh -i ~/.ssh/pi_deploy_key -o StrictHostKeyChecking=no \
+            "pi@${HOST}" \
+            "cd /opt/blackroad/portfolio && \
+             pip install -r requirements.txt 2>/dev/null; \
+             sudo systemctl restart blackroad-api 2>/dev/null || \
+             echo 'Service restart skipped (systemd not configured)'"
+
+          echo "Deployed to $NODE ($HOST)"
+
+  health-check:
+    name: Post-Deploy Health Check
+    needs: deploy
+    runs-on: ubuntu-latest
+    if: always() && needs.deploy.result == 'success'
+
+    steps:
+      - name: Check Pi fleet health
+        env:
+          PI_PRIMARY_HOST: ${{ secrets.PI_PRIMARY_HOST }}
+          PI_SECONDARY_HOST: ${{ secrets.PI_SECONDARY_HOST }}
+          PI_BACKUP_HOST: ${{ secrets.PI_BACKUP_HOST }}
+        run: |
+          HEALTHY=0
+          TOTAL=0
+
+          for HOST_VAR in PI_PRIMARY_HOST PI_SECONDARY_HOST PI_BACKUP_HOST; do
+            HOST="${!HOST_VAR}"
+            if [ -n "$HOST" ]; then
+              TOTAL=$((TOTAL + 1))
+              if curl -sf "http://${HOST}:8000/health" --max-time 10 >/dev/null 2>&1; then
+                echo "$HOST_VAR ($HOST): HEALTHY"
+                HEALTHY=$((HEALTHY + 1))
+              else
+                echo "$HOST_VAR ($HOST): UNREACHABLE"
+              fi
+            fi
+          done
+
+          if [ "$TOTAL" -eq 0 ]; then
+            echo "No Pi hosts configured — skipping health check"
+            exit 0
+          fi
+
+          echo ""
+          echo "Fleet health: $HEALTHY/$TOTAL nodes healthy"
+
+          if [ "$HEALTHY" -eq 0 ]; then
+            echo "CRITICAL: No healthy nodes!"
+            exit 1
+          fi
